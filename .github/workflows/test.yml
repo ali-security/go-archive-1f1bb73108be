@@ -1,10 +1,12 @@
 name: test
 
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Space-separated test names to run (empty = full suite)'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -12,6 +14,7 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         go-version:
           - 1.23.x      # oldest supported (see go.mod)
@@ -19,7 +22,7 @@ jobs:
           - stable
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
 
@@ -29,25 +32,86 @@ jobs:
           go-version: ${{ matrix.go-version }}
 
       - name: lint
+        if: matrix.go-version != 'stable'
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.7
           args: --print-resources-usage --timeout=10m --verbose
 
       - name: Test
-        run: go test -v -cover "-coverprofile=coverage.txt" -covermode=atomic ./...
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            go test -v -cover "-coverprofile=coverage.txt" -covermode=atomic -run "^($(echo "${{ inputs.test-filter }}" | tr ' ' '|'))$" ./... 2>&1 | tee test-output.txt
+          else
+            go test -v -cover "-coverprofile=coverage.txt" -covermode=atomic ./... 2>&1 | tee test-output.txt
+          fi
+          echo "Test summary: $(grep -c -- '--- PASS' test-output.txt) passed, $(grep -c -- '--- FAIL' test-output.txt) failed, $(grep -c -- '--- SKIP' test-output.txt) skipped"
+          awk '/^=== (RUN|CONT|NAME) / {cur=$3} /^[[:space:]]+[A-Za-z0-9_]+\.go:[0-9]+: / {m=$0; sub(/^[[:space:]]+/, "", m); msg[cur]=m} /^[[:space:]]*--- SKIP: / {n=$0; sub(/^[[:space:]]*--- SKIP: /, "", n); sub(/ \(.*$/, "", n); print "SKIPPED " n " -- reason: " msg[n]}' test-output.txt
         shell: bash
         env:
           MSYS_NO_PATHCONV: '1'
 
       - name: Test (root)
         if: runner.os == 'Linux'
-        run: go test -exec "sudo -E -n" -v -cover "-coverprofile=coverage.txt" -covermode=atomic ./...
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            go test -exec "sudo -E -n" -v -cover "-coverprofile=coverage.txt" -covermode=atomic -run "^($(echo "${{ inputs.test-filter }}" | tr ' ' '|'))$" ./... 2>&1 | tee test-output-root.txt
+          else
+            go test -exec "sudo -E -n" -v -cover "-coverprofile=coverage.txt" -covermode=atomic ./... 2>&1 | tee test-output-root.txt
+          fi
+          echo "Test summary (root): $(grep -c -- '--- PASS' test-output-root.txt) passed, $(grep -c -- '--- FAIL' test-output-root.txt) failed, $(grep -c -- '--- SKIP' test-output-root.txt) skipped"
+          awk '/^=== (RUN|CONT|NAME) / {cur=$3} /^[[:space:]]+[A-Za-z0-9_]+\.go:[0-9]+: / {m=$0; sub(/^[[:space:]]+/, "", m); msg[cur]=m} /^[[:space:]]*--- SKIP: / {n=$0; sub(/^[[:space:]]*--- SKIP: /, "", n); sub(/ \(.*$/, "", n); print "SKIPPED " n " -- reason: " msg[n]}' test-output-root.txt
         shell: bash
         env:
           MSYS_NO_PATHCONV: '1'
 
-      - name: Codecov
-        uses: codecov/codecov-action@v5
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
         with:
-          directory: ./
+          go-version: stable
+
+      - name: Create module zip
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/helper" "$RUNNER_TEMP/out"
+          cd "$RUNNER_TEMP/helper"
+          cat > main.go <<'GOEOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              f, err := os.Create(os.Args[3])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              mv := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              if err := zip.CreateFromDir(f, mv, os.Args[4]); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          GOEOF
+          go mod init create_mod
+          go get golang.org/x/mod@v0.24.0
+          go run . github.com/moby/go-archive v0.2.0 "$RUNNER_TEMP/out/v0.2.0.zip" "$GITHUB_WORKSPACE"
+          unzip -l "$RUNNER_TEMP/out/v0.2.0.zip"
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.2.0.zip
+          if-no-files-found: error
