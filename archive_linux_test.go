@@ -188,3 +188,36 @@ func TestOverlayTarAUFSUntar(t *testing.T) {
 	checkFileMode(t, filepath.Join(dst, "d2", "f1"), 0o660)
 	checkFileMode(t, filepath.Join(dst, "d3", WhiteoutPrefix+"f1"), 0o600)
 }
+
+// TestOverlayWhiteoutThroughAbsoluteSymlinkContained verifies that overlay
+// whiteouts (character devices) and opaque-directory xattrs for entries
+// beneath an archive-provided absolute symlink are created relative to the
+// extraction root, and never on the files outside of it that the symlink
+// points to.
+func TestOverlayWhiteoutThroughAbsoluteSymlinkContained(t *testing.T) {
+	skip.If(t, os.Getuid() != 0, "skipping test that requires root")
+	skip.If(t, userns.RunningInUserNS(), "skipping test that requires initial userns (trusted.overlay.opaque xattr cannot be set in userns, even with Ubuntu kernel)")
+
+	base := t.TempDir()
+	dest := filepath.Join(base, "dest")
+	victim := filepath.Join(base, "victim")
+	assert.NilError(t, os.Mkdir(dest, 0o755))
+	assert.NilError(t, os.MkdirAll(filepath.Join(victim, "sub"), 0o755))
+
+	buf := writeTestTar(t, "",
+		&tar.Header{Name: "evil", Typeflag: tar.TypeSymlink, Linkname: victim},
+		&tar.Header{Name: "evil/" + WhiteoutPrefix + "newnode", Typeflag: tar.TypeReg, Mode: 0o644},
+		&tar.Header{Name: "evil/sub/" + WhiteoutOpaqueDir, Typeflag: tar.TypeReg, Mode: 0o644},
+	)
+	err := Untar(buf, dest, &TarOptions{WhiteoutFormat: OverlayWhiteoutFormat})
+	assert.NilError(t, err)
+
+	// Nothing may have been created in, or modified on, the victim directory.
+	_, err = os.Lstat(filepath.Join(victim, "newnode"))
+	assert.Check(t, os.IsNotExist(err), "archive breakout: whiteout created in %q: %v", victim, err)
+	checkOpaqueness(t, filepath.Join(victim, "sub"), "")
+
+	// The whiteouts are instead applied relative to the extraction root.
+	checkOverlayWhiteout(t, filepath.Join(dest, victim, "newnode"))
+	checkOpaqueness(t, filepath.Join(dest, victim, "sub"), "y")
+}

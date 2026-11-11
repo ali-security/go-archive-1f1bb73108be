@@ -2,10 +2,12 @@ package archive
 
 import (
 	"archive/tar"
+	"bytes"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/moby/go-archive/compression"
@@ -192,6 +194,77 @@ func TestApplyLayerInvalidSymlink(t *testing.T) {
 		if err := testBreakout("applylayer", "docker-TestApplyLayerInvalidSymlink", headers); err != nil {
 			t.Fatalf("i=%d. %v", i, err)
 		}
+	}
+}
+
+// TestApplyLayerInvalidWhiteout verifies that a whiteout for ".." (".wh...")
+// cannot be used to remove the parent directory of the extraction root, and
+// everything in it.
+func TestApplyLayerInvalidWhiteout(t *testing.T) {
+	for i, headers := range [][]*tar.Header{
+		{ // try removing the parent of dest, including victim
+			{
+				Name:     WhiteoutPrefix + "..",
+				Typeflag: tar.TypeReg,
+				Mode:     0o644,
+			},
+		},
+		{ // try removing the parent of dest, including victim (leading slash)
+			{
+				Name:     "/" + WhiteoutPrefix + "..",
+				Typeflag: tar.TypeReg,
+				Mode:     0o644,
+			},
+		},
+	} {
+		if err := testBreakout("applylayer", "docker-TestApplyLayerInvalidWhiteout", headers); err != nil {
+			t.Fatalf("i=%d. %v", i, err)
+		}
+	}
+}
+
+// TestUnpackLayerWhiteoutDestContained verifies that a whiteout cannot be used
+// to remove the extraction root itself.
+func TestUnpackLayerWhiteoutDestContained(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		entry string
+	}{
+		{name: "dot", entry: WhiteoutPrefix + "."},
+		{name: "empty", entry: WhiteoutPrefix},
+		{name: "nested dotdot", entry: "dir/" + WhiteoutPrefix + ".."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dest := t.TempDir()
+			if err := os.Mkdir(filepath.Join(dest, "dir"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(dest, "marker")
+			if err := os.WriteFile(marker, []byte("marker"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			buf := &bytes.Buffer{}
+			tw := tar.NewWriter(buf)
+			if err := tw.WriteHeader(&tar.Header{
+				Name:     tc.entry,
+				Typeflag: tar.TypeReg,
+				Mode:     0o644,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := tw.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err := UnpackLayer(dest, buf, &TarOptions{NoLchown: true})
+			if err == nil || !strings.Contains(err.Error(), "invalid whiteout entry") {
+				t.Fatalf("expected invalid whiteout entry error, got: %v", err)
+			}
+			if _, err := os.Stat(marker); err != nil {
+				t.Fatalf("archive breakout: extraction root removed: %v", err)
+			}
+		})
 	}
 }
 
